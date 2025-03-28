@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Tanarus Clone - Mobile & Desktop</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <style>
+    body { margin: 0; overflow: hidden; background: #333; }
+    canvas { width: 100%; height: 100%; display: block; }
+    #joystick, #shootBtn { position: absolute; background: rgba(255, 255, 255, 0.3); border-radius: 50%; }
+    #joystick { width: 100px; height: 100px; bottom: 20px; left: 20px; display: none; }
+    #shootBtn { width: 80px; height: 80px; bottom: 20px; right: 20px; display: none; }
+    #stick { width: 40px; height: 40px; background: white; border-radius: 50%; position: absolute; }
+    @media (pointer: coarse) {
+      #joystick, #shootBtn { display: block; }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+  <div id="joystick"><div id="stick"></div></div>
+  <div id="shootBtn"></div>
+  <script>
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+
+    // Updated Tank Definitions
+    const tanks = [
+      { name: "Vanguard", speed: 5, power: 25, maxHealth: 100, width: 40, height: 30, turretLength: 25, color: "green" },
+      { name: "Lightning", speed: 8.75, power: 15, maxHealth: 75, width: 30, height: 20, turretLength: 20, color: "lime" },
+      { name: "Titan", speed: 2, power: 40, maxHealth: 150, width: 50, height: 40, turretLength: 30, color: "darkgreen" }
+    ];
+
+    let gameState = "selection";
+    let selectedTank = null;
+    let playerTank = null;
+    let enemy = { 
+      x: canvas.width / 2, y: 50, angle: 0, turretAngle: 0, vx: 0, vy: 0, speed: 1, health: 100, maxHealth: 100, 
+      exploded: false, particles: [], respawnTimer: 0, bullets: [], shotCooldown: 0, invulnerable: 120,
+      width: 40, height: 30, turretLength: 25, targetX: 0, targetY: 0, patrolTimer: 0
+    };
+    let score = 0;
+    const playerBase = { x: canvas.width / 2, y: canvas.height - 70, size: 60 };
+    const enemyBase = { x: canvas.width / 2, y: 50, size: 60 };
+    const obstacles = [];
+    for (let i = 0; i < 3; i++) {
+      let x, y;
+      do {
+        x = Math.random() * (canvas.width - 150) + 50;
+        y = Math.random() * (canvas.height - 200) + 100;
+      } while (Math.sqrt((x - playerBase.x) ** 2 + (y - playerBase.y) ** 2) < 100 ||
+               Math.sqrt((x - enemyBase.x) ** 2 + (y - enemyBase.y) ** 2) < 100);
+      obstacles.push({ x, y, width: Math.random() * 100 + 50, height: Math.random() * 100 + 20 });
+    }
+    let keys = {};
+    let mouseX = 0, mouseY = 0, mouseDown = false, prevMouseDown = false;
+    let joystick = { active: false, x: 0, y: 0, dx: 0, dy: 0 };
+    let shooting = false;
+    let hoveredTankIndex = -1;
+    let prevHoveredTankIndex = -1;
+
+    const shootSound = new Audio("shoot.flac");
+    const explosionSound = new Audio("explosion.flac");
+    const hoverSound = new Audio("hover.flac");
+    const selectSound = new Audio("select.flac");
+    const refillSound = new Audio("refill.flac");
+
+    [shootSound, explosionSound, hoverSound, selectSound, refillSound].forEach(sound => {
+      sound.load();
+    });
+
+    document.addEventListener("keydown", (e) => { keys[e.key] = true; });
+    document.addEventListener("keyup", (e) => { keys[e.key] = false; });
+    canvas.addEventListener("mousemove", (e) => {
+      mouseX = e.clientX;
+      mouseY = e.clientY;
+      if (gameState === "selection") updateHoverState();
+    });
+    canvas.addEventListener("mousedown", (e) => {
+      mouseDown = true;
+      if (gameState === "selection") selectTank(e.clientX, e.clientY);
+    });
+    canvas.addEventListener("mouseup", () => { mouseDown = false; });
+
+    const joystickEl = document.getElementById("joystick");
+    const stickEl = document.getElementById("stick");
+    const shootBtn = document.getElementById("shootBtn");
+
+    joystickEl.addEventListener("touchstart", (e) => {
+      e.preventDefault();
+      if (gameState === "playing") {
+        joystick.active = true;
+        updateJoystick(e.touches[0]);
+      }
+    });
+    joystickEl.addEventListener("touchmove", (e) => {
+      e.preventDefault();
+      if (gameState === "playing") updateJoystick(e.touches[0]);
+    });
+    joystickEl.addEventListener("touchend", () => {
+      joystick.active = false;
+      joystick.dx = 0;
+      joystick.dy = 0;
+      stickEl.style.left = "30px";
+      stickEl.style.top = "30px";
+    });
+
+    shootBtn.addEventListener("touchstart", (e) => { e.preventDefault(); if (gameState === "playing") shooting = true; });
+    shootBtn.addEventListener("touchend", () => { shooting = false; });
+
+    canvas.addEventListener("touchstart", (e) => {
+      e.preventDefault();
+      if (gameState === "selection") selectTank(e.touches[0].clientX, e.touches[0].clientY);
+    });
+
+    function updateJoystick(touch) {
+      const rect = joystickEl.getBoundingClientRect();
+      joystick.x = touch.clientX - rect.left - 50;
+      joystick.y = touch.clientY - rect.top - 50;
+      const dist = Math.sqrt(joystick.x * joystick.x + joystick.y * joystick.y);
+      if (dist > 30) {
+        joystick.x = (joystick.x / dist) * 30;
+        joystick.y = (joystick.y / dist) * 30;
+      }
+      stickEl.style.left = (30 + joystick.x) + "px";
+      stickEl.style.top = (30 + joystick.y) + "px";
+      joystick.dx = joystick.x / 30;
+      joystick.dy = joystick.y / 30;
+    }
+
+    function updateHoverState() {
+      const tankWidth = 200;
+      const tankHeight = 100;
+      const startX = (canvas.width - tankWidth * 3) / 2;
+      hoveredTankIndex = -1;
+      for (let i = 0; i < 3; i++) {
+        const x = startX + i * tankWidth;
+        if (mouseX > x && mouseX < x + tankWidth && mouseY > 200 && mouseY < 200 + tankHeight) {
+          hoveredTankIndex = i;
+          break;
+        }
+      }
+      if (hoveredTankIndex !== prevHoveredTankIndex && hoveredTankIndex !== -1) {
+        hoverSound.currentTime = 0;
+        hoverSound.play().catch(error => console.log("Hover sound failed:", error));
+      }
+      prevHoveredTankIndex = hoveredTankIndex;
+    }
+
+    function selectTank(clickX, clickY) {
+      const tankWidth = 200;
+      const tankHeight = 100;
+      const startX = (canvas.width - tankWidth * 3) / 2;
+      for (let i = 0; i < 3; i++) {
+        const x = startX + i * tankWidth;
+        if (clickX > x && clickX < x + tankWidth && clickY > 200 && clickY < 200 + tankHeight) {
+          selectedTank = tanks[i];
+          playerTank = { 
+            x: playerBase.x, y: playerBase.y, angle: 0, turretAngle: 0, vx: 0, vy: 0, speed: selectedTank.speed, bullets: [], 
+            health: selectedTank.maxHealth, maxHealth: selectedTank.maxHealth, exploded: false, particles: [], 
+            respawnTimer: 0, invulnerable: 120, width: selectedTank.width, height: selectedTank.height, 
+            turretLength: selectedTank.turretLength, power: selectedTank.power, color: selectedTank.color 
+          };
+          gameState = "playing";
+          selectSound.currentTime = 0;
+          selectSound.play();
+          break;
+        }
+      }
+    }
+
+    function collidesWithObstacle(obj, x, y) {
+      return obstacles.some(o => 
+        x > o.x - obj.width / 2 && x < o.x + o.width + obj.width / 2 && 
+        y > o.y - obj.height / 2 && y < o.y + o.height + obj.height / 2
+      );
+    }
+
+    function collidesWithTank(t1, t2, x1, y1) {
+      const dx = x1 - t2.x;
+      const dy = y1 - t2.y;
+      return Math.sqrt(dx * dx + dy * dy) < (t1.width + t2.width) / 2;
+    }
+
+    function inBase(tank, base) {
+      const dx = tank.x - base.x;
+      const dy = tank.y - base.y;
+      return Math.sqrt(dx * dx + dy * dy) < base.size / 2 + tank.width / 2;
+    }
+
+    function createExplosion(t, isPlayer) {
+      t.particles = [];
+      for (let i = 0; i < 10; i++) {
+        t.particles.push({
+          x: t.x, y: t.y, vx: (Math.random() - 0.5) * 2, vy: (Math.random() - 0.5) * 2,
+          size: Math.random() * 10 + 5, type: "smoke", life: 60
+        });
+      }
+      for (let i = 0; i < 5; i++) {
+        t.particles.push({
+          x: t.x, y: t.y, vx: (Math.random() - 0.5) * 5, vy: (Math.random() - 0.5) * 5,
+          size: Math.random() * 5 + 2, type: "debris", life: 40
+        });
+      }
+      explosionSound.currentTime = 0;
+      explosionSound.play();
+      if (!isPlayer) score++;
+    }
+
+    function calculateSteering(tank, targetX, targetY) {
+      const maxSpeed = tank.speed;
+      const maxAcceleration = 0.1;
+
+      let desiredVx = targetX - tank.x;
+      let desiredVy = targetY - tank.y;
+      const desiredMag = Math.sqrt(desiredVx * desiredVx + desiredVy * desiredVy);
+      if (desiredMag > 0) {
+        desiredVx = (desiredVx / desiredMag) * maxSpeed;
+        desiredVy = (desiredVy / desiredMag) * maxSpeed;
+      }
+
+      let avoidForceX = 0, avoidForceY = 0;
+      obstacles.forEach(o => {
+        const aheadX = tank.x + tank.vx * 20;
+        const aheadY = tank.y + tank.vy * 20;
+        const closestX = Math.max(o.x, Math.min(aheadX, o.x + o.width));
+        const closestY = Math.max(o.y, Math.min(aheadY, o.y + o.height));
+        const dx = aheadX - closestX;
+        const dy = aheadY - closestY;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < tank.width && dist > 0) {
+          const force = (tank.width - dist) / tank.width * maxAcceleration;
+          avoidForceX += dx / dist * force;
+          avoidForceY += dy / dist * force;
+        }
+      });
+
+      if (!playerTank.exploded) {
+        const dx = tank.x - playerTank.x;
+        const dy = tank.y - playerTank.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < (tank.width + playerTank.width) / 2 && dist > 0) {
+          const force = ((tank.width + playerTank.width) / 2 - dist) / ((tank.width + playerTank.width) / 2) * maxAcceleration;
+          avoidForceX += dx / dist * force;
+          avoidForceY += dy / dist * force;
+        }
+      }
+
+      const steeringVx = desiredVx - tank.vx + avoidForceX;
+      const steeringVy = desiredVy - tank.vy + avoidForceY;
+      const steeringMag = Math.sqrt(steeringVx * steeringVx + steeringVy * steeringVy);
+      if (steeringMag > maxAcceleration) {
+        const scale = maxAcceleration / steeringMag;
+        tank.vx += steeringVx * scale;
+        tank.vy += steeringVy * scale;
+      } else {
+        tank.vx += steeringVx;
+        tank.vy += steeringVy;
+      }
+
+      const speedMag = Math.sqrt(tank.vx * tank.vx + tank.vy * tank.vy);
+      if (speedMag > maxSpeed) {
+        tank.vx = (tank.vx / speedMag) * maxSpeed;
+        tank.vy = (tank.vy / speedMag) * maxSpeed;
+      }
+
+      if (speedMag > 0.01) tank.angle = Math.atan2(tank.vy, tank.vx);
+    }
+
+    function update() {
+      if (gameState !== "playing") return;
+
+      if (!playerTank.exploded) {
+        let moveForward = keys["w"] || keys["W"] || keys["ArrowUp"];
+        let moveBackward = keys["s"] || keys["S"] || keys["ArrowDown"];
+        let turnLeft = keys["a"] || keys["A"] || keys["ArrowLeft"];
+        let turnRight = keys["d"] || keys["D"] || keys["ArrowRight"];
+        let shoot = keys[" "] || (mouseDown && !prevMouseDown);
+
+        if (moveForward) {
+          playerTank.vx += Math.cos(playerTank.angle) * 0.1;
+          playerTank.vy += Math.sin(playerTank.angle) * 0.1;
+        }
+        if (moveBackward) {
+          playerTank.vx -= Math.cos(playerTank.angle) * 0.1;
+          playerTank.vy -= Math.sin(playerTank.angle) * 0.1;
+        }
+        if (turnLeft) playerTank.angle -= 0.05;
+        if (turnRight) playerTank.angle += 0.05;
+
+        if (joystick.active) {
+          let desiredVx = joystick.dx * playerTank.speed;
+          let desiredVy = joystick.dy * playerTank.speed;
+          playerTank.vx += (desiredVx - playerTank.vx) * 0.1;
+          playerTank.vy += (desiredVy - playerTank.vy) * 0.1;
+          if (Math.abs(joystick.dx) > 0.1 || Math.abs(joystick.dy) > 0.1) {
+            playerTank.angle = Math.atan2(joystick.dy, joystick.dx);
+          }
+        }
+
+        playerTank.turretAngle = Math.atan2(mouseY - playerTank.y, mouseX - playerTank.x);
+
+        let newX = playerTank.x + playerTank.vx;
+        let newY = playerTank.y + playerTank.vy;
+        if (!collidesWithObstacle(playerTank, newX, newY) && 
+            (!enemy.exploded || !collidesWithTank(playerTank, enemy, newX, newY))) {
+          playerTank.x = newX;
+          playerTank.y = newY;
+        } else if (!enemy.exploded && collidesWithTank(playerTank, enemy, newX, newY)) {
+          const dx = playerTank.x - enemy.x;
+          const dy = playerTank.y - enemy.y;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          if (dist > 0) {
+            const overlap = (playerTank.width + enemy.width) / 2 - dist;
+            playerTank.x += dx / dist * overlap / 2;
+            playerTank.y += dy / dist * overlap / 2;
+            enemy.x -= dx / dist * overlap / 2;
+            enemy.y -= dy / dist * overlap / 2;
+          }
+        }
+
+        if (shoot && !playerTank.shotCooldown && !playerTank.invulnerable) {
+          playerTank.bullets.push({ x: playerTank.x, y: playerTank.y, angle: playerTank.turretAngle, speed: 5 });
+          playerTank.shotCooldown = 20;
+          shootSound.currentTime = 0;
+          shootSound.play();
+        }
+        if (playerTank.shotCooldown) playerTank.shotCooldown--;
+        if (playerTank.invulnerable) playerTank.invulnerable--;
+        if (inBase(playerTank, playerBase) && playerTank.health < playerTank.maxHealth && !(playerTank.invulnerable % 30)) {
+          const prevHealth = playerTank.health;
+          playerTank.health = Math.min(playerTank.maxHealth, playerTank.health + 2);
+          if (playerTank.health > prevHealth) {
+            refillSound.currentTime = 0;
+            refillSound.play();
+          }
+        }
+
+        playerTank.vx *= 0.95;
+        playerTank.vy *= 0.95;
+      } else {
+        playerTank.particles.forEach((p, i) => {
+          p.x += p.vx;
+          p.y += p.vy;
+          p.life--;
+          if (p.type === "smoke") p.size += 0.2;
+          if (p.type === "debris") p.vy += 0.1;
+          if (p.life <= 0) playerTank.particles.splice(i, 1);
+        });
+        if (playerTank.particles.length === 0) {
+          playerTank.respawnTimer++;
+          if (playerTank.respawnTimer > 60) {
+            playerTank.x = playerBase.x;
+            playerTank.y = playerBase.y;
+            playerTank.health = playerTank.maxHealth;
+            playerTank.exploded = false;
+            playerTank.respawnTimer = 0;
+            playerTank.invulnerable = 120;
+            playerTank.vx = 0;
+            playerTank.vy = 0;
+          }
+        }
+      }
+
+      playerTank.bullets = playerTank.bullets.filter(b => b.x > 0 && b.x < canvas.width && b.y > 0 && b.y < canvas.height && !collidesWithObstacle(playerTank, b.x, b.y));
+      playerTank.bullets.forEach((b, index) => {
+        b.x += Math.cos(b.angle) * b.speed;
+        b.y += Math.sin(b.angle) * b.speed;
+        if (!enemy.exploded && !enemy.invulnerable) {
+          const dx = b.x - enemy.x;
+          const dy = b.y - enemy.y;
+          if (Math.sqrt(dx * dx + dy * dy) < enemy.width / 2) {
+            enemy.health -= playerTank.power;
+            playerTank.bullets.splice(index, 1);
+            if (enemy.health <= 0) {
+              enemy.exploded = true;
+              createExplosion(enemy, false);
+            }
+          }
+        }
+      });
+
+      if (!enemy.exploded) {
+        let dx = playerTank.x - enemy.x;
+        let dy = playerTank.y - enemy.y;
+        let dist = Math.sqrt(dx * dx + dy * dy);
+
+        enemy.turretAngle = Math.atan2(dy, dx);
+        if (dist < 300) {
+          calculateSteering(enemy, playerTank.x, playerTank.y);
+        } else {
+          if (enemy.patrolTimer <= 0 || Math.abs(enemy.x - enemy.targetX) < 10 && Math.abs(enemy.y - enemy.targetY) < 10) {
+            enemy.targetX = Math.random() * (canvas.width - 100) + 50;
+            enemy.targetY = Math.random() * (canvas.height - 200) + 100;
+            enemy.patrolTimer = 180;
+          }
+          calculateSteering(enemy, enemy.targetX, enemy.targetY);
+          enemy.patrolTimer--;
+        }
+
+        enemy.x += enemy.vx;
+        enemy.y += enemy.vy;
+
+        if (dist < 300 && !enemy.shotCooldown && !enemy.invulnerable && Math.random() < 0.02) {
+          enemy.bullets.push({ x: enemy.x, y: enemy.y, angle: enemy.turretAngle, speed: 4 });
+          enemy.shotCooldown = 60;
+          shootSound.currentTime = 0;
+          shootSound.play();
+        }
+        if (enemy.shotCooldown) enemy.shotCooldown--;
+        if (enemy.invulnerable) enemy.invulnerable--;
+        if (inBase(enemy, enemyBase) && enemy.health < enemy.maxHealth && !(enemy.invulnerable % 30)) {
+          const prevHealth = enemy.health;
+          enemy.health = Math.min(enemy.maxHealth, enemy.health + 2);
+          if (enemy.health > prevHealth) {
+            refillSound.currentTime = 0;
+            refillSound.play();
+          }
+        }
+      } else {
+        enemy.particles.forEach((p, i) => {
+          p.x += p.vx;
+          p.y += p.vy;
+          p.life--;
+          if (p.type === "smoke") p.size += 0.2;
+          if (p.type === "debris") p.vy += 0.1;
+          if (p.life <= 0) enemy.particles.splice(i, 1);
+        });
+        if (enemy.particles.length === 0) {
+          enemy.respawnTimer++;
+          if (enemy.respawnTimer > 60) {
+            enemy.x = enemyBase.x;
+            enemy.y = enemyBase.y;
+            enemy.health = enemy.maxHealth;
+            enemy.exploded = false;
+            enemy.respawnTimer = 0;
+            enemy.invulnerable = 120;
+            enemy.vx = 0;
+            enemy.vy = 0;
+          }
+        }
+      }
+
+      enemy.bullets = enemy.bullets.filter(b => b.x > 0 && b.x < canvas.width && b.y > 0 && b.y < canvas.height && !collidesWithObstacle(enemy, b.x, b.y));
+      enemy.bullets.forEach((b, index) => {
+        b.x += Math.cos(b.angle) * b.speed;
+        b.y += Math.sin(b.angle) * b.speed;
+        if (!playerTank.exploded && !playerTank.invulnerable) {
+          const dx = b.x - playerTank.x;
+          const dy = b.y - playerTank.y;
+          if (Math.sqrt(dx * dx + dy * dy) < playerTank.width / 2) {
+            playerTank.health -= 25;
+            enemy.bullets.splice(index, 1);
+            if (playerTank.health <= 0) {
+              playerTank.exploded = true;
+              createExplosion(playerTank, true);
+            }
+          }
+        }
+      });
+
+      playerTank.x = Math.max(playerTank.width / 2, Math.min(canvas.width - playerTank.width / 2, playerTank.x));
+      playerTank.y = Math.max(playerTank.height / 2, Math.min(canvas.height - playerTank.height / 2, playerTank.y));
+      enemy.x = Math.max(enemy.width / 2, Math.min(canvas.width - enemy.width / 2, enemy.x));
+      enemy.y = Math.max(enemy.height / 2, Math.min(canvas.height - enemy.height / 2, enemy.y));
+
+      prevMouseDown = mouseDown;
+    }
+
+    function drawTank(tank) {
+      ctx.save();
+      ctx.translate(tank.x, tank.y);
+      ctx.rotate(tank.angle);
+      ctx.fillStyle = tank.invulnerable ? "rgba(0, 255, 0, 0.5)" : tank.color;
+      ctx.fillRect(-tank.width / 2, -tank.height / 2, tank.width, tank.height);
+      ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+      ctx.fillRect(-tank.width / 2 + 5, -tank.height / 2, tank.width - 10, 5);
+      ctx.fillRect(-tank.width / 2 + 5, tank.height / 2 - 5, tank.width - 10, 5);
+      ctx.rotate(tank.turretAngle - tank.angle);
+      ctx.fillStyle = "darkgray";
+      ctx.fillRect(0, -5, tank.turretLength, 10);
+      ctx.fillStyle = "black";
+      ctx.fillRect(tank.turretLength - 5, -3, 5, 6);
+      ctx.restore();
+
+      ctx.fillStyle = "gray";
+      ctx.fillRect(tank.x - 25, tank.y - 30, 50, 5);
+      ctx.fillStyle = "green";
+      ctx.fillRect(tank.x - 25, tank.y - 30, (tank.health / tank.maxHealth) * 50, 5);
+    }
+
+    function drawEnemyTank(tank) {
+      ctx.save();
+      ctx.translate(tank.x, tank.y);
+      ctx.rotate(tank.angle);
+      ctx.fillStyle = tank.invulnerable ? "rgba(255, 0, 0, 0.5)" : "red";
+      ctx.fillRect(-tank.width / 2, -tank.height / 2, tank.width, tank.height);
+      ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+      ctx.fillRect(-tank.width / 2 + 5, -tank.height / 2, tank.width - 10, 5);
+      ctx.fillRect(-tank.width / 2 + 5, tank.height / 2 - 5, tank.width - 10, 5);
+      ctx.rotate(tank.turretAngle - tank.angle);
+      ctx.fillStyle = "darkred";
+      ctx.fillRect(0, -5, tank.turretLength, 10);
+      ctx.fillStyle = "black";
+      ctx.fillRect(tank.turretLength - 5, -3, 5, 6);
+      ctx.restore();
+
+      ctx.fillStyle = "gray";
+      ctx.fillRect(tank.x - 25, tank.y - 30, 50, 5);
+      ctx.fillStyle = "green";
+      ctx.fillRect(tank.x - 25, tank.y - 30, (tank.health / tank.maxHealth) * 50, 5);
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (gameState === "selection") {
+        ctx.fillStyle = "white";
+        ctx.font = "30px Arial";
+        ctx.fillText("Select Your Tank (Click or Tap)", canvas.width / 2 - 200, 100);
+
+        const tankWidth = 200;
+        const tankHeight = 100;
+        const startX = (canvas.width - tankWidth * 3) / 2;
+        for (let i = 0; i < 3; i++) {
+          const x = startX + i * tankWidth;
+          const tank = tanks[i];
+          
+          if (i === hoveredTankIndex) {
+            ctx.strokeStyle = "yellow";
+            ctx.lineWidth = 3;
+            ctx.strokeRect(x, 200 - 20, tankWidth, tankHeight + 40);
+          }
+
+          ctx.fillStyle = tank.color;
+          ctx.fillRect(x + 50, 200, tank.width, tank.height);
+          ctx.fillStyle = "rgba(0, 0, 0, 0.5)";
+          ctx.fillRect(x + 55, 200, tank.width - 10, 5);
+          ctx.fillRect(x + 55, 220, tank.width - 10, 5);
+          ctx.fillStyle = "darkgray";
+          ctx.fillRect(x + 65, 190, tank.turretLength, 10);
+          ctx.fillStyle = "black";
+          ctx.fillRect(x + 65 + tank.turretLength - 5, 192, 5, 6);
+          
+          ctx.fillStyle = "white";
+          ctx.font = "20px Arial";
+          ctx.fillText(tank.name, x + 50, 260);
+          ctx.fillText(`Speed: ${tank.speed}`, x + 50, 290);
+          ctx.fillText(`Power: ${tank.power}`, x + 50, 310);
+          ctx.fillText(`HP: ${tank.maxHealth}`, x + 50, 330);
+        }
+      } else {
+        ctx.fillStyle = "green";
+        ctx.fillRect(playerBase.x - playerBase.size / 2, playerBase.y - playerBase.size / 2, playerBase.size, playerBase.size);
+        ctx.fillStyle = "red";
+        ctx.fillRect(enemyBase.x - enemyBase.size / 2, enemyBase.y - enemyBase.size / 2, enemyBase.size, enemyBase.size);
+
+        ctx.fillStyle = "brown";
+        obstacles.forEach(o => ctx.fillRect(o.x, o.y, o.width, o.height));
+
+        if (!playerTank.exploded) drawTank(playerTank);
+        else {
+          playerTank.particles.forEach(p => {
+            if (p.type === "smoke") {
+              ctx.fillStyle = `rgba(100, 100, 100, ${p.life / 60})`;
+              ctx.beginPath();
+              ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+              ctx.fill();
+            } else if (p.type === "debris") {
+              ctx.fillStyle = Math.random() > 0.5 ? playerTank.color : "gray";
+              ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+            }
+          });
+        }
+
+        ctx.fillStyle = "yellow";
+        playerTank.bullets.forEach(b => {
+          ctx.beginPath();
+          ctx.arc(b.x, b.y, 3, 0, Math.PI * 2);
+          ctx.fill();
+        });
+        ctx.fillStyle = "orange";
+        enemy.bullets.forEach(b => {
+          ctx.beginPath();
+          ctx.arc(b.x, b.y, 3, 0, Math.PI * 2);
+          ctx.fill();
+        });
+
+        if (!enemy.exploded) drawEnemyTank(enemy);
+        else {
+          enemy.particles.forEach(p => {
+            if (p.type === "smoke") {
+              ctx.fillStyle = `rgba(100, 100, Too Long 100, ${p.life / 60})`;
+              ctx.beginPath();
+              ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+              ctx.fill();
+            } else if (p.type === "debris") {
+              ctx.fillStyle = Math.random() > 0.5 ? "red" : "gray";
+              ctx.fillRect(p.x - p.size / 2, p.y - p.size / 2, p.size, p.size);
+            }
+          });
+        }
+
+        ctx.fillStyle = "white";
+        ctx.font = "20px Arial";
+        ctx.fillText(`Kills: ${score}`, 10, 30);
+        ctx.fillText("Controls: WASD/Arrows (Move), Mouse (Aim), Space/Click (Shoot)", 10, canvas.height - 10);
+      }
+    }
+
+    function gameLoop() {
+      update();
+      draw();
+      requestAnimationFrame(gameLoop);
+    }
+    gameLoop();
+  </script>
+</body>
+</html>
